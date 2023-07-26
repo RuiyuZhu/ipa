@@ -3,6 +3,7 @@ use crate::{
     protocol::RecordId,
     sync::{Arc, Mutex},
 };
+
 use futures::{task::Waker, Future, Stream};
 use generic_array::GenericArray;
 use std::{
@@ -12,7 +13,20 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+
 use typenum::Unsigned;
+
+#[cfg(debug_assertions)]
+use crate::helpers::buffers::LoggingRanges;
+
+#[cfg(debug_assertions)]
+use std::ops::{Deref, DerefMut};
+
+#[cfg(debug_assertions)]
+type StateType<S, C> = IdleTrackOperatingState<S, C>;
+
+#[cfg(not(debug_assertions))]
+type StateType<S, C> = OperatingState<S, C>;
 
 /// A future for receiving item `i` from an `UnorderedReceiver`.
 pub struct Receiver<S, C, M>
@@ -22,7 +36,7 @@ where
     M: Message,
 {
     i: usize,
-    receiver: Arc<Mutex<OperatingState<S, C>>>,
+    receiver: Arc<Mutex<StateType<S, C>>>,
     _marker: PhantomData<M>,
 }
 
@@ -73,7 +87,7 @@ impl Spare {
         self.buf.extend_from_slice(v);
     }
 
-    /// Extend the buffer with new data.  
+    /// Extend the buffer with new data.
     /// This returns a message if there is enough data.
     /// This returns a value because it can be more efficient in cases where
     /// received chunks don't align with messages.
@@ -150,6 +164,23 @@ where
     S: Stream<Item = C> + Send,
     C: AsRef<[u8]>,
 {
+    fn new(
+        stream: Pin<Box<S>>,
+        next: usize,
+        spare: Spare,
+        wakers: Vec<Option<Waker>>,
+        overflow_wakers: Vec<Waker>,
+        marker: PhantomData<C>,
+    ) -> Self {
+        Self {
+            stream,
+            next,
+            spare,
+            wakers,
+            overflow_wakers,
+            _marker: marker,
+        }
+    }
     /// Determine whether `i` is the next record that we expect to receive.
     fn is_next(&self, i: usize) -> bool {
         i == self.next
@@ -228,6 +259,75 @@ where
     }
 }
 
+#[cfg(debug_assertions)]
+struct IdleTrackOperatingState<S, C>
+where
+    S: Stream<Item = C>,
+    C: AsRef<[u8]>,
+{
+    state: OperatingState<S, C>,
+    current_next: usize,
+}
+
+#[cfg(debug_assertions)]
+impl<S, C> IdleTrackOperatingState<S, C>
+where
+    S: Stream<Item = C> + Send,
+    C: AsRef<[u8]>,
+{
+    fn new(
+        stream: Pin<Box<S>>,
+        next: usize,
+        spare: Spare,
+        wakers: Vec<Option<Waker>>,
+        overflow_wakers: Vec<Waker>,
+        marker: PhantomData<C>,
+    ) -> Self {
+        Self {
+            state: OperatingState::new(stream, next, spare, wakers, overflow_wakers, marker),
+            current_next: next,
+        }
+    }
+    fn check_idle_and_reset(&mut self) -> bool {
+        let rst = self.current_next == self.state.next;
+        self.current_next = self.state.next;
+        rst
+    }
+    #[cfg(debug_assertions)]
+    fn get_waiting_messages(&self) -> LoggingRanges {
+        let mut response = vec![self.next];
+        for i in (self.next + 1)..=(self.next + self.wakers.len()) {
+            if self.wakers[i % self.wakers.len()].is_some() {
+                response.push(i);
+            }
+        }
+        LoggingRanges::from(&response)
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<S, C> Deref for IdleTrackOperatingState<S, C>
+where
+    S: Stream<Item = C>,
+    C: AsRef<[u8]>,
+{
+    type Target = OperatingState<S, C>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<S, C> DerefMut for IdleTrackOperatingState<S, C>
+where
+    S: Stream<Item = C>,
+    C: AsRef<[u8]>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
 /// Take an ordered stream of bytes and make messages from that stream
 /// available in any order.
 pub struct UnorderedReceiver<S, C>
@@ -235,7 +335,7 @@ where
     S: Stream<Item = C>,
     C: AsRef<[u8]>,
 {
-    inner: Arc<Mutex<OperatingState<S, C>>>,
+    inner: Arc<Mutex<StateType<S, C>>>,
 }
 
 #[allow(dead_code)]
@@ -257,14 +357,14 @@ where
         assert!(capacity.get() > 1, "a capacity of 1 is too small");
         let wakers = vec![None; capacity.get()];
         Self {
-            inner: Arc::new(Mutex::new(OperatingState {
+            inner: Arc::new(Mutex::new(StateType::new(
                 stream,
-                next: 0,
-                spare: Spare::default(),
+                0,
+                Spare::default(),
                 wakers,
-                overflow_wakers: Vec::new(),
-                _marker: PhantomData,
-            })),
+                Vec::new(),
+                PhantomData,
+            ))),
         }
     }
 
@@ -293,6 +393,67 @@ where
         Self {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+pub struct IdleTrackUnorderedReceiver<S, C>(UnorderedReceiver<S, C>)
+where
+    S: Stream<Item = C>,
+    C: AsRef<[u8]>;
+
+#[cfg(debug_assertions)]
+impl<S, C> IdleTrackUnorderedReceiver<S, C>
+where
+    S: Stream<Item = C> + Send,
+    C: AsRef<[u8]>,
+{
+    pub fn new(stream: Pin<Box<S>>, capacity: NonZeroUsize) -> Self {
+        Self(UnorderedReceiver::new(stream, capacity))
+    }
+
+    pub fn check_idle_and_reset(&self) -> bool {
+        #[cfg(not(debug_assertions))]
+        return false;
+        #[cfg(debug_assertions)]
+        self.0.inner.lock().unwrap().check_idle_and_reset()
+    }
+
+    pub fn get_waiting_messages(&self) -> LoggingRanges {
+        self.0.inner.lock().unwrap().get_waiting_messages()
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<S, C> Deref for IdleTrackUnorderedReceiver<S, C>
+where
+    S: Stream<Item = C>,
+    C: AsRef<[u8]>,
+{
+    type Target = UnorderedReceiver<S, C>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<S, C> DerefMut for IdleTrackUnorderedReceiver<S, C>
+where
+    S: Stream<Item = C>,
+    C: AsRef<[u8]>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<S, C> Clone for IdleTrackUnorderedReceiver<S, C>
+where
+    S: Stream<Item = C> + Send,
+    C: AsRef<[u8]>,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 

@@ -15,9 +15,17 @@ use crate::{
     },
     protocol::QueryId,
 };
+
 #[cfg(all(feature = "shuttle", test))]
 use shuttle::future as tokio;
-use std::{fmt::Debug, num::NonZeroUsize};
+
+#[cfg(all(feature = "shuttle", test, debug_assertions))]
+type JoinHandle = shuttle::future::JoinHandle<()>;
+
+#[cfg(all(not(all(feature = "shuttle", test)), debug_assertions))]
+type JoinHandle = tokio::task::JoinHandle<()>;
+
+use std::{fmt::Debug, num::NonZeroUsize, sync::Arc};
 
 /// Alias for the currently configured transport.
 ///
@@ -37,11 +45,26 @@ pub type ReceivingEnd<M> = ReceivingEndBase<TransportImpl, M>;
 /// used to avoid carrying `T` over.
 ///
 /// [`Gateway`]: crate::helpers::Gateway
+#[cfg(debug_assertions)]
+use std::time::Duration;
+
+#[cfg(debug_assertions)]
+type SenderType = Arc<GatewaySenders>;
+#[cfg(debug_assertions)]
+type ReceiverType<T> = Arc<GatewayReceivers<T>>;
+
+#[cfg(not(debug_assertions))]
+type SenderType = GatewaySenders;
+#[cfg(not(debug_assertions))]
+type ReceiverType<T> = GatewayReceivers<T>;
+
 pub struct Gateway<T: Transport = TransportImpl> {
     config: GatewayConfig,
     transport: RoleResolvingTransport<T>,
-    senders: GatewaySenders,
-    receivers: GatewayReceivers<T>,
+    senders: SenderType,
+    receivers: ReceiverType<T>,
+    #[cfg(debug_assertions)]
+    idle_tracking_handle: Option<JoinHandle>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +75,9 @@ pub struct GatewayConfig {
 }
 
 impl<T: Transport> Gateway<T> {
+    /// Create a new gateway.
+    /// ## Panics
+    /// panic may happen if `maybe_sender_clone/maybe_receivers_clone` are None in debug mode due to errors
     #[must_use]
     pub fn new(
         query_id: QueryId,
@@ -59,6 +85,24 @@ impl<T: Transport> Gateway<T> {
         roles: RoleAssignment,
         transport: T,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        let (senders, maybe_senders_clone) = Self::get_default_senders();
+        #[cfg(not(debug_assertions))]
+        let (senders, _) = Self::get_default_senders();
+        #[cfg(debug_assertions)]
+        let (receivers, maybe_receivers_clone) = Self::get_default_receivers();
+        #[cfg(not(debug_assertions))]
+        let (receivers, _) = Self::get_default_receivers();
+        #[cfg(debug_assertions)]
+        let handle = if cfg!(debug_assertions) {
+            Some(Self::create_idle_tracker(
+                maybe_senders_clone.unwrap(),
+                maybe_receivers_clone.unwrap(),
+            ))
+        } else {
+            None
+        };
+
         Self {
             config,
             transport: RoleResolvingTransport {
@@ -67,14 +111,38 @@ impl<T: Transport> Gateway<T> {
                 inner: transport,
                 config,
             },
-            senders: GatewaySenders::default(),
-            receivers: GatewayReceivers::default(),
+            senders,
+            receivers,
+            #[cfg(debug_assertions)]
+            idle_tracking_handle: handle,
         }
     }
 
     #[must_use]
     pub fn role(&self) -> Role {
         self.transport.role()
+    }
+
+    fn get_default_senders() -> (SenderType, Option<Arc<GatewaySenders>>) {
+        #[cfg(debug_assertions)]
+        {
+            let default_senders = Arc::new(GatewaySenders::default());
+            let clone = Arc::clone(&default_senders);
+            (default_senders, Some(clone))
+        }
+        #[cfg(not(debug_assertions))]
+        return (GatewaySenders::default(), None);
+    }
+
+    fn get_default_receivers() -> (ReceiverType<T>, Option<Arc<GatewayReceivers<T>>>) {
+        #[cfg(debug_assertions)]
+        {
+            let default_receivers = Arc::new(GatewayReceivers::default());
+            let clone = Arc::clone(&default_receivers);
+            (default_receivers, Some(clone))
+        }
+        #[cfg(not(debug_assertions))]
+        return (GatewayReceivers::default(), None);
     }
 
     #[must_use]
@@ -115,6 +183,44 @@ impl<T: Transport> Gateway<T> {
             self.receivers
                 .get_or_create(channel_id, || self.transport.receive(channel_id)),
         )
+    }
+
+    #[cfg(debug_assertions)]
+    fn create_idle_tracker(
+        senders: Arc<GatewaySenders>,
+        receivers: Arc<GatewayReceivers<T>>,
+    ) -> JoinHandle {
+        tokio::spawn(async move {
+            // Perform some periodic work in the background
+            loop {
+                let _ = ::tokio::time::sleep(Duration::from_secs(5)).await;
+                if senders.check_idle_and_reset() && receivers.check_idle_and_reset() {
+                    let sender_missing_records = senders.get_all_missing_messages();
+                    if !sender_missing_records.is_empty() {
+                        tracing::warn!(
+                            "Idle: waiting to send messages:\n{:?}",
+                            sender_missing_records
+                        );
+                    }
+                    let receiver_waiting_message = receivers.get_waiting_messages();
+                    if !receiver_waiting_message.is_empty() {
+                        tracing::warn!(
+                            "Idle: waiting to receive messages:\n{:?}.",
+                            receiver_waiting_message
+                        );
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<T: Transport> Drop for Gateway<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.idle_tracking_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -209,6 +315,8 @@ mod tests {
         // sent (same batch or different does not matter here)
         let spawned = tokio::spawn(async move {
             let channel = sender_ctx.send_channel(Role::H2);
+            // channel.send(RecordId::from(1), Fp31::truncate_from(1_u128)).await.unwrap();
+            // channel.send(RecordId::from(0), Fp31::truncate_from(0_u128)).await.unwrap();
             try_join(
                 channel.send(RecordId::from(1), Fp31::truncate_from(1_u128)),
                 channel.send(RecordId::from(0), Fp31::truncate_from(0_u128)),

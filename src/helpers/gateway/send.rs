@@ -1,4 +1,4 @@
-use crate::sync::Arc;
+use crate::{ff::Serializable, sync::Arc};
 use dashmap::DashMap;
 use futures::Stream;
 use std::{
@@ -10,13 +10,19 @@ use std::{
 use typenum::Unsigned;
 
 use crate::{
-    helpers::{buffers::OrderingSender, ChannelId, Error, Message, Role, TotalRecords},
+    helpers::{ChannelId, Error, Message, Role, TotalRecords},
     protocol::RecordId,
     telemetry::{
         labels::{ROLE, STEP},
         metrics::{BYTES_SENT, RECORDS_SENT},
     },
 };
+
+#[cfg(debug_assertions)]
+use crate::helpers::buffers::LoggingRanges;
+
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
 
 /// Sending end of the gateway channel.
 pub struct SendingEnd<M: Message> {
@@ -32,9 +38,20 @@ pub(super) struct GatewaySenders {
     inner: DashMap<ChannelId, Arc<GatewaySender>>,
 }
 
+#[cfg(debug_assertions)]
+use crate::helpers::buffers::IdleTrackOrderingSender;
+#[cfg(debug_assertions)]
+type OrderingSenderType = IdleTrackOrderingSender;
+
+#[cfg(not(debug_assertions))]
+use crate::helpers::buffers::OrderingSender;
+
+#[cfg(not(debug_assertions))]
+type OrderingSenderType = OrderingSender;
+
 pub(super) struct GatewaySender {
     channel_id: ChannelId,
-    ordering_tx: OrderingSender,
+    ordering_tx: OrderingSenderType,
     total_records: TotalRecords,
 }
 
@@ -43,7 +60,7 @@ pub(super) struct GatewaySendStream {
 }
 
 impl GatewaySender {
-    fn new(channel_id: ChannelId, tx: OrderingSender, total_records: TotalRecords) -> Self {
+    fn new(channel_id: ChannelId, tx: OrderingSenderType, total_records: TotalRecords) -> Self {
         Self {
             channel_id,
             ordering_tx: tx,
@@ -73,8 +90,17 @@ impl GatewaySender {
         if self.total_records.is_last(record_id) {
             self.ordering_tx.close(i + 1).await;
         }
-
         Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_idle_and_reset(&self) -> bool {
+        self.ordering_tx.check_idle_and_reset()
+    }
+
+    #[cfg(debug_assertions)]
+    fn get_missing_messages(&self) -> Vec<LoggingRanges> {
+        self.ordering_tx.get_missing_messages()
     }
 }
 
@@ -146,7 +172,11 @@ impl GatewaySenders {
 
             let sender = Arc::new(GatewaySender::new(
                 channel_id.clone(),
-                OrderingSender::new(write_size, SPARE.unwrap()),
+                OrderingSenderType::new(
+                    write_size,
+                    SPARE.unwrap(),
+                    <M as Serializable>::Size::to_usize(),
+                ),
                 total_records,
             ));
             if senders
@@ -160,6 +190,30 @@ impl GatewaySenders {
             };
             (sender, Some(stream))
         }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn check_idle_and_reset(&self) -> bool {
+        let mut rst = true;
+        for entry in self.inner.iter() {
+            rst &= entry.value().check_idle_and_reset();
+        }
+        rst
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn get_all_missing_messages(&self) -> HashMap<ChannelId, Vec<LoggingRanges>> {
+        self.inner
+            .iter()
+            .filter_map(|entry| {
+                let mising_messages = entry.value().get_missing_messages();
+                if mising_messages.is_empty() {
+                    None
+                } else {
+                    Some((entry.key().clone(), mising_messages))
+                }
+            })
+            .collect()
     }
 }
 

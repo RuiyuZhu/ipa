@@ -24,6 +24,18 @@ use std::{
 };
 use typenum::Unsigned;
 
+#[cfg(debug_assertions)]
+use crate::helpers::buffers::LoggingRanges;
+
+#[cfg(debug_assertions)]
+use std::ops::{Deref, DerefMut};
+
+#[cfg(debug_assertions)]
+type StateType = IdleTrackState;
+
+#[cfg(not(debug_assertions))]
+type StateType = State;
+
 /// The operating state for an `OrderingSender`.
 struct State {
     /// A store of bytes to write into.
@@ -97,7 +109,6 @@ impl State {
         if self.written > 0 && (self.written + self.spare.get() >= self.buf.len() || self.closed) {
             let v = self.buf[..self.written].to_vec();
             self.written = 0;
-
             Self::wake(&mut self.write_ready);
             Poll::Ready(v)
         } else {
@@ -110,6 +121,47 @@ impl State {
         debug_assert!(!self.closed);
         self.closed = true;
         Self::wake(&mut self.stream_ready);
+    }
+}
+
+#[cfg(debug_assertions)]
+struct IdleTrackState {
+    state: State,
+    idle: bool,
+}
+
+#[cfg(debug_assertions)]
+impl IdleTrackState {
+    fn new(capacity: NonZeroUsize, spare: NonZeroUsize) -> Self {
+        IdleTrackState {
+            state: State::new(capacity, spare),
+            idle: true,
+        }
+    }
+    fn write<M: Message>(&mut self, m: &M, cx: &Context<'_>) -> Poll<()> {
+        self.idle = false;
+        self.state.write(m, cx)
+    }
+    fn check_idle_and_reset(&mut self) -> bool {
+        let rst = self.idle;
+        self.idle = true;
+        rst
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Deref for IdleTrackState {
+    type Target = State;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[cfg(debug_assertions)]
+impl DerefMut for IdleTrackState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
     }
 }
 
@@ -165,6 +217,14 @@ impl WaitingShard {
             self.wakers.pop_front().unwrap().w.wake();
         }
     }
+
+    fn get_waiting_messages(&self) -> Vec<usize> {
+        let mut result = Vec::new();
+        for j in (0..self.wakers.len()).rev() {
+            result.push(self.wakers[j].i);
+        }
+        result
+    }
 }
 
 /// A collection of wakers that are indexed by the send index (`i`).
@@ -197,6 +257,15 @@ impl Waiting {
     fn wake(&self, i: usize) {
         self.shard(i).wake(i);
     }
+
+    fn get_waiting_messages(&self) -> Vec<usize> {
+        let mut waiting_messages = self.shards[0].lock().unwrap().get_waiting_messages();
+        for i in 1..self.shards.len() {
+            waiting_messages.extend(self.shards[i].lock().unwrap().get_waiting_messages());
+        }
+        waiting_messages.sort_unstable();
+        waiting_messages
+    }
 }
 
 /// An `OrderingSender` accepts messages for sending in any order, but
@@ -222,22 +291,24 @@ impl Waiting {
 /// [`close`]: OrderingSender::close
 pub struct OrderingSender {
     next: AtomicUsize,
-    state: Mutex<State>,
+    state: Mutex<StateType>,
     waiting: Waiting,
+    message_size: usize,
 }
 
 impl OrderingSender {
     /// Make an `OrderingSender` with a capacity of `capacity` (in bytes).
     #[must_use]
-    pub fn new(write_size: NonZeroUsize, spare: NonZeroUsize) -> Self {
+    pub fn new(write_size: NonZeroUsize, spare: NonZeroUsize, message_size: usize) -> Self {
         Self {
             next: AtomicUsize::new(0),
-            state: Mutex::new(State::new(write_size, spare)),
+            state: Mutex::new(StateType::new(write_size, spare)),
             waiting: Waiting::default(),
+            message_size,
         }
     }
 
-    /// Send a message, `m`, at the index `i`.  
+    /// Send a message, `m`, at the index `i`.
     /// This method blocks until all previous messages are sent and until sufficient
     /// space becomes available in the sender's buffer.
     ///
@@ -270,7 +341,7 @@ impl OrderingSender {
     /// Perform the next `send` or `close` operation.
     fn next_op<F>(&self, i: usize, cx: &Context<'_>, f: F) -> Poll<()>
     where
-        F: FnOnce(&mut MutexGuard<'_, State>) -> Poll<()>,
+        F: FnOnce(&mut MutexGuard<'_, StateType>) -> Poll<()>,
     {
         // This load here is on the hot path.
         // Don't acquire the state mutex unless this test passes.
@@ -326,6 +397,62 @@ impl OrderingSender {
 
     pub(crate) fn as_rc_stream(self: Arc<Self>) -> OrderedStream<Arc<Self>> {
         OrderedStream { sender: self }
+    }
+}
+
+pub struct IdleTrackOrderingSender(OrderingSender);
+
+#[cfg(debug_assertions)]
+impl IdleTrackOrderingSender {
+    pub fn new(write_size: NonZeroUsize, spare: NonZeroUsize, message_size: usize) -> Self {
+        Self(OrderingSender::new(write_size, spare, message_size))
+    }
+
+    pub fn check_idle_and_reset(&self) -> bool {
+        #[cfg(not(debug_assertions))]
+        return false;
+        #[cfg(debug_assertions)]
+        self.0.state.lock().unwrap().check_idle_and_reset()
+    }
+
+    pub fn get_missing_messages(&self) -> Vec<LoggingRanges> {
+        let waiting_messages = self.0.waiting.get_waiting_messages();
+        if waiting_messages.is_empty() {
+            return vec![];
+        }
+        let last_pending_message = waiting_messages.iter().copied().max().unwrap();
+        let next = self.0.next.load(Acquire);
+        let state = self.0.state.lock().unwrap();
+        let chunk_head = next - state.written / self.0.message_size;
+        let chunk_size = state.buf.len() / self.0.message_size;
+        let chunk_count = (last_pending_message - chunk_head + chunk_size - 1) / chunk_size;
+        let mut responses = Vec::new();
+        for i in 0..chunk_count {
+            let mut chunk_response = Vec::new();
+            for j in (chunk_head + i * chunk_size)..chunk_head + (i + 1) * chunk_size {
+                if !waiting_messages.contains(&j) {
+                    chunk_response.push(j);
+                }
+            }
+            responses.push(LoggingRanges::from(&chunk_response));
+        }
+        responses
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Deref for IdleTrackOrderingSender {
+    type Target = OrderingSender;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(debug_assertions)]
+impl DerefMut for IdleTrackOrderingSender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -415,6 +542,7 @@ mod test {
         Arc::new(OrderingSender::new(
             NonZeroUsize::new(6).unwrap(),
             NonZeroUsize::new(5).unwrap(),
+            4,
         ))
     }
 

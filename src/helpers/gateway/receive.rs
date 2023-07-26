@@ -1,10 +1,22 @@
 use crate::{
-    helpers::{buffers::UnorderedReceiver, ChannelId, Error, Message, Transport},
+    helpers::{ChannelId, Error, Message, Transport},
     protocol::RecordId,
 };
 use dashmap::DashMap;
 use futures::Stream;
 use std::marker::PhantomData;
+
+#[cfg(debug_assertions)]
+use crate::helpers::buffers::LoggingRanges;
+
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
+
+#[cfg(debug_assertions)]
+use crate::helpers::buffers::IdleTrackUnorderedReceiver;
+
+#[cfg(not(debug_assertions))]
+use crate::helpers::buffers::UnorderedReceiver;
 
 /// Receiving end end of the gateway channel.
 pub struct ReceivingEnd<T: Transport, M: Message> {
@@ -18,6 +30,13 @@ pub(super) struct GatewayReceivers<T: Transport> {
     inner: DashMap<ChannelId, UR<T>>,
 }
 
+#[cfg(debug_assertions)]
+pub(super) type UR<T> = IdleTrackUnorderedReceiver<
+    <T as Transport>::RecordsStream,
+    <<T as Transport>::RecordsStream as Stream>::Item,
+>;
+
+#[cfg(not(debug_assertions))]
 pub(super) type UR<T> = UnorderedReceiver<
     <T as Transport>::RecordsStream,
     <<T as Transport>::RecordsStream as Stream>::Item,
@@ -71,5 +90,28 @@ impl<T: Transport> GatewayReceivers<T> {
             receivers.insert(channel_id.clone(), stream.clone());
             stream
         }
+    }
+    #[cfg(debug_assertions)]
+    pub fn check_idle_and_reset(&self) -> bool {
+        let mut rst = true;
+        for entry in self.inner.iter() {
+            rst &= entry.value().check_idle_and_reset();
+        }
+        rst
+    }
+    #[cfg(debug_assertions)]
+    pub fn get_waiting_messages(&self) -> HashMap<ChannelId, LoggingRanges> {
+        self.inner
+            .iter()
+            .filter_map(|entry| {
+                let (channel_id, rec) = entry.pair();
+                let message = rec.get_waiting_messages();
+                if message.is_empty() {
+                    None
+                } else {
+                    Some((channel_id.clone(), message))
+                }
+            })
+            .collect()
     }
 }
